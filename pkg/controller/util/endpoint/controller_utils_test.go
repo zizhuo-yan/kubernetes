@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"math/rand"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -662,5 +663,142 @@ func Test_podChanged(t *testing.T) {
 				t.Errorf("Expected labelsChanged to be %t, got %t", tc.labelsChanged, labelsChanged)
 			}
 		})
+	}
+}
+
+func newService(name, ns string, selector map[string]string) *v1.Service {
+	return &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+		Spec: v1.ServiceSpec{
+			Selector: selector,
+		},
+	}
+}
+func newPod(name, ns string, labels map[string]string) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      name,
+			Labels:    labels,
+		},
+	}
+}
+
+type TestCase struct {
+	Pod    *v1.Pod
+	Expect sets.String
+}
+
+// 场景一：每个service只匹配一个Pod
+// Scenario I: each service have only one matched pod.
+// TestCase I: update 1 pod
+// TestCase II: update 100 pods
+func BenchmarkGetPodServiceMemberships_1VS1_TestCaseI(b *testing.B) {
+	// init service cache.
+	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		pod := newPod("test-pod-0", "test", map[string]string{"app": "test-0"})
+		expect := sets.NewString("test-pod-0")
+		return pod, expect
+	}
+	pod, _ := getPod()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), pod)
+	}
+}
+
+func BenchmarkGetPodServiceMemberships_1VS1_TestCaseII(b *testing.B) {
+	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
+
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		rand.Seed(time.Now().UnixNano())
+		i := rand.Intn(10000)
+		pod := newPod(fmt.Sprintf("test-pod-%d", i), "test", map[string]string{
+			"app": fmt.Sprintf("test-%d", i),
+		})
+		expect := sets.NewString(fmt.Sprintf("test/service-%d", i))
+		return pod, expect
+	}
+	tcs := []TestCase{}
+	for i := 0; i < 100; i++ {
+		pod, expect := getPod()
+		tc := TestCase{Pod: pod, Expect: expect}
+		tcs = append(tcs, tc)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), tcs[j].Pod)
+		}
+	}
+	//fmt.Println(pod.Name, expect.List())
+}
+// 场景二：所有svc都关联同一个pod
+// Scenario I: all the services matched the same pod.
+// TestCase I: update 1 pod
+// TestCase II: update 100 pods
+func BenchmarkGetPodServiceMemberships_NVS1_TestCaseI(b *testing.B) {
+	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	expect := sets.NewString()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": "test-0"})
+		key := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+		expect.Insert(key)
+		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
+	}
+	pod := newPod("test-pod-0", "test", map[string]string{"app": "test-0"})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), pod)
+	}
+}
+func BenchmarkGetPodServiceMemberships_NVS1_TestCaseII(b *testing.B) {
+	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	expect := sets.NewString()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": "test-0"})
+		key := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+		expect.Insert(key)
+		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		rand.Seed(time.Now().UnixNano())
+		i := rand.Intn(10000)
+		pod := newPod(fmt.Sprintf("test-pod-%d", i), "test", map[string]string{
+			"app": "test-0",
+		})
+		expect := sets.NewString()
+		return pod, expect
+	}
+	tcs := []TestCase{}
+	for i := 0; i < 100; i++ {
+		pod, _ := getPod()
+		tc := TestCase{Pod: pod, Expect: expect}
+		tcs = append(tcs, tc)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), tcs[j].Pod)
+		}
 	}
 }
