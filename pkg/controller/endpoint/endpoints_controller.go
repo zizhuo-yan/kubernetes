@@ -204,11 +204,7 @@ func (e *EndpointController) Run(workers int, stopCh <-chan struct{}) {
 // enqueue them. obj must have *v1.Pod type.
 func (e *EndpointController) addPod(obj interface{}) {
 	pod := obj.(*v1.Pod)
-	services, err := e.serviceSelectorCache.GetPodServiceMemberships(e.serviceLister, pod)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", pod.Namespace, pod.Name, err))
-		return
-	}
+	services := e.serviceSelectorCache.GetPodServiceMemberships(pod)
 	for key := range services {
 		e.queue.AddAfter(key, e.endpointUpdatesBatchPeriod)
 	}
@@ -251,7 +247,7 @@ func podToEndpointAddressForService(svc *v1.Service, pod *v1.Pod) (*v1.EndpointA
 // and what services it will be a member of, and enqueue the union of these.
 // old and cur must be *v1.Pod types.
 func (e *EndpointController) updatePod(old, cur interface{}) {
-	services := endpointutil.GetServicesToUpdateOnPodChange(e.serviceLister, e.serviceSelectorCache, old, cur)
+	services := e.serviceSelectorCache.GetServicesToUpdateOnPodChange(old, cur)
 	for key := range services {
 		e.queue.AddAfter(key, e.endpointUpdatesBatchPeriod)
 	}
@@ -274,7 +270,7 @@ func (e *EndpointController) onServiceUpdate(obj interface{}) {
 		return
 	}
 
-	_ = e.serviceSelectorCache.Update(key, obj.(*v1.Service).Spec.Selector)
+	_ = e.serviceSelectorCache.Update(key, obj.(*v1.Service))
 	e.queue.Add(key)
 }
 
@@ -286,7 +282,7 @@ func (e *EndpointController) onServiceDelete(obj interface{}) {
 		return
 	}
 
-	e.serviceSelectorCache.Delete(key)
+	e.serviceSelectorCache.Delete(key, obj.(*v1.Service))
 	e.queue.Add(key)
 }
 

@@ -370,7 +370,7 @@ func (c *Controller) onServiceUpdate(obj interface{}) {
 		return
 	}
 
-	_ = c.serviceSelectorCache.Update(key, obj.(*v1.Service).Spec.Selector)
+	_ = c.serviceSelectorCache.Update(key, obj.(*v1.Service))
 	c.queue.Add(key)
 }
 
@@ -381,8 +381,7 @@ func (c *Controller) onServiceDelete(obj interface{}) {
 		utilruntime.HandleError(fmt.Errorf("Couldn't get key for object %+v: %v", obj, err))
 		return
 	}
-
-	c.serviceSelectorCache.Delete(key)
+	c.serviceSelectorCache.Delete(key, obj.(*v1.Service))
 	c.queue.Add(key)
 }
 
@@ -446,18 +445,14 @@ func (c *Controller) queueServiceForEndpointSlice(endpointSlice *discovery.Endpo
 
 func (c *Controller) addPod(obj interface{}) {
 	pod := obj.(*v1.Pod)
-	services, err := c.serviceSelectorCache.GetPodServiceMemberships(c.serviceLister, pod)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", pod.Namespace, pod.Name, err))
-		return
-	}
+	services := c.serviceSelectorCache.GetPodServiceMemberships(pod)
 	for key := range services {
 		c.queue.AddAfter(key, c.endpointUpdatesBatchPeriod)
 	}
 }
 
 func (c *Controller) updatePod(old, cur interface{}) {
-	services := endpointutil.GetServicesToUpdateOnPodChange(c.serviceLister, c.serviceSelectorCache, old, cur)
+	services := c.serviceSelectorCache.GetServicesToUpdateOnPodChange(old, cur)
 	for key := range services {
 		c.queue.AddAfter(key, c.endpointUpdatesBatchPeriod)
 	}

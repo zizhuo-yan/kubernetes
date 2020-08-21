@@ -18,6 +18,7 @@ package endpoint
 
 import (
 	"fmt"
+	"math/rand"
 	"reflect"
 	"testing"
 	"time"
@@ -26,8 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/informers"
-	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestDetermineNeededServiceUpdates(t *testing.T) {
@@ -332,174 +331,6 @@ func genSimpleSvc(namespace, name string) *v1.Service {
 	}
 }
 
-func TestServiceSelectorCache_GetPodServiceMemberships(t *testing.T) {
-	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
-	for i := 0; i < 3; i++ {
-		service := &v1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("service-%d", i),
-				Namespace: "test",
-			},
-			Spec: v1.ServiceSpec{
-				Selector: map[string]string{
-					"app": fmt.Sprintf("test-%d", i),
-				},
-			},
-		}
-		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
-	}
-	var pods []*v1.Pod
-	for i := 0; i < 5; i++ {
-		pod := &v1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: "test",
-				Name:      fmt.Sprintf("test-pod-%d", i),
-				Labels: map[string]string{
-					"app":   fmt.Sprintf("test-%d", i),
-					"label": fmt.Sprintf("label-%d", i),
-				},
-			},
-		}
-		pods = append(pods, pod)
-	}
-
-	cache := NewServiceSelectorCache()
-	tests := []struct {
-		name   string
-		pod    *v1.Pod
-		expect sets.String
-	}{
-		{
-			name:   "get servicesMemberships for pod-0",
-			pod:    pods[0],
-			expect: sets.NewString("test/service-0"),
-		},
-		{
-			name:   "get servicesMemberships for pod-1",
-			pod:    pods[1],
-			expect: sets.NewString("test/service-1"),
-		},
-		{
-			name:   "get servicesMemberships for pod-2",
-			pod:    pods[2],
-			expect: sets.NewString("test/service-2"),
-		},
-		{
-			name:   "get servicesMemberships for pod-3",
-			pod:    pods[3],
-			expect: sets.NewString(),
-		},
-		{
-			name:   "get servicesMemberships for pod-4",
-			pod:    pods[4],
-			expect: sets.NewString(),
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			services, err := cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), test.pod)
-			if err != nil {
-				t.Errorf("Error from cache.GetPodServiceMemberships: %v", err)
-			} else if !services.Equal(test.expect) {
-				t.Errorf("Expect service %v, but got %v", test.expect, services)
-			}
-		})
-	}
-}
-
-func TestServiceSelectorCache_Update(t *testing.T) {
-	var selectors []labels.Selector
-	for i := 0; i < 5; i++ {
-		selector := labels.Set(map[string]string{"app": fmt.Sprintf("test-%d", i)}).AsSelectorPreValidated()
-		selectors = append(selectors, selector)
-	}
-	tests := []struct {
-		name   string
-		key    string
-		cache  *ServiceSelectorCache
-		update map[string]string
-		expect labels.Selector
-	}{
-		{
-			name:   "add test/service-0",
-			key:    "test/service-0",
-			cache:  generateServiceSelectorCache(map[string]labels.Selector{}),
-			update: map[string]string{"app": "test-0"},
-			expect: selectors[0],
-		},
-		{
-			name:   "add test/service-1",
-			key:    "test/service-1",
-			cache:  generateServiceSelectorCache(map[string]labels.Selector{"test/service-0": selectors[0]}),
-			update: map[string]string{"app": "test-1"},
-			expect: selectors[1],
-		},
-		{
-			name:   "update test/service-2",
-			key:    "test/service-2",
-			cache:  generateServiceSelectorCache(map[string]labels.Selector{"test/service-2": selectors[2]}),
-			update: map[string]string{"app": "test-0"},
-			expect: selectors[0],
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			selector := test.cache.Update(test.key, test.update)
-			if !reflect.DeepEqual(selector, test.expect) {
-				t.Errorf("Expect selector %v , but got %v", test.expect, selector)
-			}
-		})
-	}
-}
-
-func generateServiceSelectorCache(cache map[string]labels.Selector) *ServiceSelectorCache {
-	return &ServiceSelectorCache{
-		cache: cache,
-	}
-}
-
-func BenchmarkGetPodServiceMemberships(b *testing.B) {
-	// init fake service informer.
-	fakeInformerFactory := informers.NewSharedInformerFactory(&fake.Clientset{}, 0*time.Second)
-	for i := 0; i < 1000; i++ {
-		service := &v1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("service-%d", i),
-				Namespace: "test",
-			},
-			Spec: v1.ServiceSpec{
-				Selector: map[string]string{
-					"app": fmt.Sprintf("test-%d", i),
-				},
-			},
-		}
-		fakeInformerFactory.Core().V1().Services().Informer().GetStore().Add(service)
-	}
-
-	pod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "test",
-			Name:      "test-pod-0",
-			Labels: map[string]string{
-				"app": "test-0",
-			},
-		},
-	}
-
-	cache := NewServiceSelectorCache()
-	expect := sets.NewString("test/service-0")
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		services, err := cache.GetPodServiceMemberships(fakeInformerFactory.Core().V1().Services().Lister(), pod)
-		if err != nil {
-			b.Fatalf("Error from GetPodServiceMemberships(): %v", err)
-		}
-		if len(services) != len(expect) {
-			b.Errorf("Expect services size %d, but got: %v", len(expect), len(services))
-		}
-	}
-}
-
 func Test_podChanged(t *testing.T) {
 	testCases := []struct {
 		testName      string
@@ -662,5 +493,317 @@ func Test_podChanged(t *testing.T) {
 				t.Errorf("Expected labelsChanged to be %t, got %t", tc.labelsChanged, labelsChanged)
 			}
 		})
+	}
+}
+
+func TestServiceSelectorCache_GetPodServiceMemberships(t *testing.T) {
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 3; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		cache.Update(fmt.Sprintf("%s/%s", service.Namespace, service.Name), service)
+	}
+	var pods []*v1.Pod
+	for i := 0; i < 5; i++ {
+		pod := newPod(fmt.Sprintf("test-pod-%d", i), "test", map[string]string{
+			"app":   fmt.Sprintf("test-%d", i),
+			"label": fmt.Sprintf("label-%d", i),
+		})
+		pods = append(pods, pod)
+	}
+	tests := []struct {
+		name   string
+		pod    *v1.Pod
+		expect sets.String
+	}{
+		{
+			name:   "get servicesMemberships for pod-0",
+			pod:    pods[0],
+			expect: sets.NewString("test/service-0"),
+		},
+		{
+			name:   "get servicesMemberships for pod-1",
+			pod:    pods[1],
+			expect: sets.NewString("test/service-1"),
+		},
+		{
+			name:   "get servicesMemberships for pod-2",
+			pod:    pods[2],
+			expect: sets.NewString("test/service-2"),
+		},
+		{
+			name:   "get servicesMemberships for pod-3",
+			pod:    pods[3],
+			expect: sets.NewString(),
+		},
+		{
+			name:   "get servicesMemberships for pod-4",
+			pod:    pods[4],
+			expect: sets.NewString(),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			services := cache.GetPodServiceMemberships(test.pod)
+			if !services.Equal(test.expect) {
+				t.Errorf("Expect service %v, but got %v", test.expect, services)
+			}
+		})
+	}
+}
+
+func TestServiceSelectorCache_Update(t *testing.T) {
+	var selectors []labels.Set
+	for i := 0; i < 5; i++ {
+		selector := labels.Set(map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		selectors = append(selectors, selector)
+	}
+	tests := []struct {
+		name             string
+		key              string
+		cache            *ServiceSelectorCache
+		updatedSVC       *v1.Service
+		expect           labels.Set
+		expectLabelCache map[string]map[string]*ServiceSelector
+	}{
+		{
+			name:       "add test/service-0",
+			key:        "test/service-0",
+			cache:      generateServiceSelectorCache(map[string]labels.Set{}),
+			updatedSVC: newService("service-0", "test", map[string]string{"app": "test-0"}),
+			expect:     selectors[0],
+		},
+		{
+			name:       "add test/service-1",
+			key:        "test/service-1",
+			cache:      generateServiceSelectorCache(map[string]labels.Set{"test/service-0": selectors[0]}),
+			updatedSVC: newService("service-1", "test", map[string]string{"app": "test-1"}),
+			expect:     selectors[1],
+		},
+		{
+			name:       "update test/service-2",
+			key:        "test/service-2",
+			cache:      generateServiceSelectorCache(map[string]labels.Set{"test/service-2": selectors[2]}),
+			updatedSVC: newService("service-2", "test", map[string]string{"app": "test-0"}),
+			expect:     selectors[0],
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selector := test.cache.Update(test.key, test.updatedSVC)
+			if !reflect.DeepEqual(selector, test.expect) {
+				t.Errorf("Expect selector %v , but got %v", test.expect, selector)
+			}
+		})
+	}
+}
+
+func TestServiceSelectorCache_UpdateServiceLabelsCache(t *testing.T) {
+	t.Logf("add test/service-0")
+	testKey := "test/service-0"
+	cache := generateServiceSelectorCache(map[string]labels.Set{})
+	svc1 := newService("service-1", "test", map[string]string{"app": "test-1"})
+	svc2 := newService("service-1", "test", map[string]string{"app": "test-1", "app2": "test-2"})
+	svc3 := newService("service-1", "test", map[string]string{"app": "test-x", "app2": "test-2"})
+	svc4 := newService("service-1", "test", map[string]string{"app2": "test-2"})
+	// add labels app=test-1
+	cache.Update(testKey, svc1)
+	nsCache, ok := cache.serviceLabelsCache["test"]
+	if !ok {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	if len(nsCache) != 1 || nsCache["app=test-1"] == nil {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	t.Logf("update svc1, add new label, serviceCache: %v", cache.serviceLabelsCache)
+	// add labels app2=test-2
+	cache.Update(testKey, svc2)
+	if !ok {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	if len(nsCache) != 2 || nsCache["app=test-1"] == nil || nsCache["app2=test-2"] == nil {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	t.Logf("update svc2, add new label, serviceCache: %v", cache.serviceLabelsCache)
+	// update labels app=test-x
+	cache.Update(testKey, svc3)
+	if !ok {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	if len(nsCache["app=test-1"]) != 0 || len(nsCache["app2=test-2"]) != 1 || len(nsCache["app=test-x"]) != 1 {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	t.Logf("update svc3, update service label value, serviceCache: %v", cache.serviceLabelsCache)
+	// delete labels app=test-x
+	cache.Update(testKey, svc4)
+	if !ok {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	if len(nsCache["app=test-1"]) != 0 || len(nsCache["app2=test-2"]) != 1 {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	t.Logf("update svc4, delete label, serviceCache: %v", cache.serviceLabelsCache)
+	// delete svc.
+	cache.Delete(testKey, svc4)
+	if len(nsCache["app=test-1"]) != 0 || len(nsCache["app2=test-2"]) != 0 || len(nsCache["app=test-x"]) != 0 || len(cache.selectorCache) != 0 {
+		t.Fatalf("unexpected service labels cache:%v", cache.serviceLabelsCache)
+	}
+	t.Logf("delete svc4, serviceCache: %v, selector cache: %v", cache.serviceLabelsCache, cache.selectorCache)
+}
+
+func newService(name, ns string, selector map[string]string) *v1.Service {
+	return &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+		Spec: v1.ServiceSpec{
+			Selector: selector,
+		},
+	}
+}
+
+func newPod(name, ns string, labels map[string]string) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      name,
+			Labels:    labels,
+		},
+	}
+}
+
+func generateServiceSelectorCache(cache map[string]labels.Set) *ServiceSelectorCache {
+	return &ServiceSelectorCache{
+		selectorCache:      cache,
+		serviceLabelsCache: map[string]map[string]map[string]*ServiceSelector{},
+	}
+}
+
+func BenchmarkGetPodServiceMemberships(b *testing.B) {
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 1000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		cache.Update(fmt.Sprintf("%s/%s", service.Namespace, service.Name), service)
+	}
+
+	pod := newPod("test-pod-0", "test", map[string]string{"app": "test-0"})
+	expect := sets.NewString("test/service-0")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		services := cache.GetPodServiceMemberships(pod)
+		if len(services) != len(expect) {
+			b.Errorf("Expect services size %d, but got: %v", len(expect), len(services))
+		}
+	}
+}
+
+type TestCase struct {
+	Pod    *v1.Pod
+	Expect sets.String
+}
+
+// Scenario I: each service have only one matched pod.
+// TestCase I: update 1 pod
+// TestCase II: update 100 pods
+func BenchmarkGetPodServiceMemberships_1VS1_TestCaseI(b *testing.B) {
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		cache.Update(fmt.Sprintf("%s/%s", service.Namespace, service.Name), service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		pod := newPod("test-pod-0", "test", map[string]string{"app": "test-0"})
+		expect := sets.NewString("test-pod-0")
+		return pod, expect
+	}
+	pod, _ := getPod()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.GetPodServiceMemberships(pod)
+	}
+}
+
+func BenchmarkGetPodServiceMemberships_1VS1_TestCaseII(b *testing.B) {
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": fmt.Sprintf("test-%d", i)})
+		cache.Update(fmt.Sprintf("%s/%s", service.Namespace, service.Name), service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		rand.Seed(time.Now().UnixNano())
+		i := rand.Intn(10000)
+		pod := newPod(fmt.Sprintf("test-pod-%d", i), "test", map[string]string{
+			"app": fmt.Sprintf("test-%d", i),
+		})
+		expect := sets.NewString(fmt.Sprintf("test/service-%d", i))
+		return pod, expect
+	}
+	tcs := []TestCase{}
+	for i := 0; i < 100; i++ {
+		pod, expect := getPod()
+		tc := TestCase{Pod: pod, Expect: expect}
+		tcs = append(tcs, tc)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			cache.GetPodServiceMemberships(tcs[j].Pod)
+		}
+	}
+}
+
+// Scenario I: all of the service matched the same pod.
+// TestCase I: update 1 pod
+// TestCase II: update 100 pods
+func BenchmarkGetPodServiceMemberships_NVS1_TestCaseI(b *testing.B) {
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	expect := sets.NewString()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": "test-0"})
+		key := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+		expect.Insert(key)
+		cache.Update(key, service)
+	}
+	pod := newPod("test-pod-0", "test", map[string]string{"app": "test-0"})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.GetPodServiceMemberships(pod)
+	}
+}
+
+func BenchmarkGetPodServiceMemberships_NVS1_TestCaseII(b *testing.B) {
+	// init service cache.
+	cache := NewServiceSelectorCache()
+	expect := sets.NewString()
+	for i := 0; i < 10000; i++ {
+		service := newService(fmt.Sprintf("service-%d", i), "test", map[string]string{"app": "test-0"})
+		key := fmt.Sprintf("%s/%s", service.Namespace, service.Name)
+		expect.Insert(key)
+		cache.Update(key, service)
+	}
+	getPod := func() (*v1.Pod, sets.String) {
+		rand.Seed(time.Now().UnixNano())
+		i := rand.Intn(10000)
+		pod := newPod(fmt.Sprintf("test-pod-%d", i), "test", map[string]string{
+			"app": "test-0",
+		})
+		expect := sets.NewString()
+		return pod, expect
+	}
+	tcs := []TestCase{}
+	for i := 0; i < 100; i++ {
+		pod, _ := getPod()
+		tc := TestCase{Pod: pod, Expect: expect}
+		tcs = append(tcs, tc)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			cache.GetPodServiceMemberships(tcs[j].Pod)
+		}
 	}
 }

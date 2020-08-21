@@ -1665,13 +1665,15 @@ func TestPodUpdatesBatching(t *testing.T) {
 
 			addPods(endpoints.podStore, ns, tc.podsCount, 1, 0, ipv4only)
 
-			endpoints.serviceStore.Add(&v1.Service{
+			svc := &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
 					Selector: map[string]string{"foo": "bar"},
 					Ports:    []v1.ServicePort{{Port: 80}},
 				},
-			})
+			}
+			// init service cache.
+			endpoints.serviceSelectorCache.Update(fmt.Sprintf("%s/%s", svc.Namespace, svc.Name), svc)
 
 			for _, update := range tc.updates {
 				time.Sleep(update.delay)
@@ -1786,13 +1788,15 @@ func TestPodAddsBatching(t *testing.T) {
 
 			go endpoints.Run(1, stopCh)
 
-			endpoints.serviceStore.Add(&v1.Service{
+			svc := &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
 					Selector: map[string]string{"foo": "bar"},
 					Ports:    []v1.ServicePort{{Port: 80}},
 				},
-			})
+			}
+			// init service cache.
+			endpoints.serviceSelectorCache.Update(fmt.Sprintf("%s/%s", svc.Namespace, svc.Name), svc)
 
 			for i, add := range tc.adds {
 				time.Sleep(add.delay)
@@ -1910,13 +1914,15 @@ func TestPodDeleteBatching(t *testing.T) {
 
 			addPods(endpoints.podStore, ns, tc.podsCount, 1, 0, ipv4only)
 
-			endpoints.serviceStore.Add(&v1.Service{
+			svc := &v1.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: ns},
 				Spec: v1.ServiceSpec{
 					Selector: map[string]string{"foo": "bar"},
 					Ports:    []v1.ServicePort{{Port: 80}},
 				},
-			})
+			}
+			// init service cache.
+			endpoints.serviceSelectorCache.Update(fmt.Sprintf("%s/%s", svc.Namespace, svc.Name), svc)
 
 			for _, update := range tc.deletes {
 				time.Sleep(update.delay)

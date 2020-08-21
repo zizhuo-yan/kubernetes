@@ -29,83 +29,160 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	v1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
-	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/util/hash"
 	utilnet "k8s.io/utils/net"
 )
 
 // ServiceSelectorCache is a cache of service selectors to avoid high CPU consumption caused by frequent calls to AsSelectorPreValidated (see #73527)
 type ServiceSelectorCache struct {
-	lock  sync.RWMutex
-	cache map[string]labels.Selector
+	selectorLock  sync.RWMutex
+	selectorCache map[string]labels.Set
+
+	serviceLabelsLock sync.RWMutex
+	// service label cache, map[namespace]map[labelKey]map[serviceName]*ServiceSelector
+	serviceLabelsCache map[string]map[string]map[string]*ServiceSelector
 }
+
+// ServiceSelector is a service label cache
+type ServiceSelector struct {
+	serviceName string
+	serviceKey  string
+	selectorSet labels.Set
+}
+
 
 // NewServiceSelectorCache init ServiceSelectorCache for both endpoint controller and endpointSlice controller.
 func NewServiceSelectorCache() *ServiceSelectorCache {
 	return &ServiceSelectorCache{
-		cache: map[string]labels.Selector{},
+		selectorCache:      map[string]labels.Set{},
+		serviceLabelsCache: map[string]map[string]map[string]*ServiceSelector{},
 	}
 }
 
-// Get return selector and existence in ServiceSelectorCache by key.
-func (sc *ServiceSelectorCache) Get(key string) (labels.Selector, bool) {
-	sc.lock.RLock()
-	selector, ok := sc.cache[key]
-	// fine-grained lock improves GetPodServiceMemberships performance(16.5%) than defer measured by BenchmarkGetPodServiceMemberships
-	sc.lock.RUnlock()
-	return selector, ok
-}
+// updateServiceLabelsCache can update or add a selector in ServiceSelectorCache.serviceLabelsCache while service's selector changed
+func (sc *ServiceSelectorCache) updateServiceLabelsCache(key string, svc *v1.Service, oldSelector labels.Set) {
+	sc.serviceLabelsLock.Lock()
+	defer sc.serviceLabelsLock.Unlock()
+	// update service label cache
+	nsLabelsCache, ok := sc.serviceLabelsCache[svc.Namespace]
+	if !ok {
+		nsLabelsCache = map[string]map[string]*ServiceSelector{}
+		// update namespace service label cache
+		sc.serviceLabelsCache[svc.Namespace] = nsLabelsCache
+	}
 
+	oldkvMap := convertSelectorToLabelsKVMap(oldSelector)
+	newkvMap := convertSelectorToLabelsKVMap(svc.Spec.Selector)
+	serviceSelector := &ServiceSelector{
+		serviceName: svc.Name,
+		serviceKey:  key,
+		selectorSet: labels.Set(svc.Spec.Selector),
+	}
+	// delete old label cache
+	for labelKey := range oldkvMap {
+		svcCache, exist := nsLabelsCache[labelKey]
+		if !exist {
+			continue
+		}
+		delete(svcCache, svc.Name)
+		// clean empty map by key label=key
+		if len(svcCache) == 0 {
+			delete(nsLabelsCache, labelKey)
+		}
+	}
+	// add/update label key.
+	for labelKey := range newkvMap {
+		svcCache, exist := nsLabelsCache[labelKey]
+		if !exist {
+			svcCache = map[string]*ServiceSelector{}
+			nsLabelsCache[labelKey] = svcCache
+		}
+		svcCache[svc.Name] = serviceSelector
+	}
+}
 // Update can update or add a selector in ServiceSelectorCache while service's selector changed.
-func (sc *ServiceSelectorCache) Update(key string, rawSelector map[string]string) labels.Selector {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-	selector := labels.Set(rawSelector).AsSelectorPreValidated()
-	sc.cache[key] = selector
+func (sc *ServiceSelectorCache) Update(key string, svc *v1.Service) labels.Set {
+	sc.selectorLock.Lock()
+	defer sc.selectorLock.Unlock()
+	selector := labels.Set(svc.Spec.Selector)
+
+	// update selector cache by service key
+	oldSelector, ok := sc.selectorCache[key]
+	if ok && reflect.DeepEqual(selector, oldSelector) {
+		return selector
+	}
+
+	// update service selector cache
+	sc.selectorCache[key] = selector
+	// update service label cache
+	sc.updateServiceLabelsCache(key, svc, oldSelector)
 	return selector
 }
 
+// deleteServiceLabelsCache can delete service from service labels cache.
+func (sc *ServiceSelectorCache) deleteServiceLabelsCache(svc *v1.Service, selector labels.Set) {
+	sc.serviceLabelsLock.Lock()
+	defer sc.serviceLabelsLock.Unlock()
+	// update label cache
+	nsLabelCache := sc.serviceLabelsCache[svc.Namespace]
+	for k, v := range selector {
+		labelKey := k + "=" + v
+		svcCache, ok := nsLabelCache[labelKey]
+		if !ok {
+			continue
+		}
+		delete(svcCache, svc.Name)
+		// clean empty map by key labelKey
+		if len(svcCache) == 0 {
+			delete(nsLabelCache, labelKey)
+		}
+	}
+}
 // Delete can delete selector which exist in ServiceSelectorCache.
-func (sc *ServiceSelectorCache) Delete(key string) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-	delete(sc.cache, key)
+func (sc *ServiceSelectorCache) Delete(key string, svc *v1.Service) {
+	sc.selectorLock.Lock()
+	defer sc.selectorLock.Unlock()
+	selector, ok := sc.selectorCache[key]
+	if !ok {
+		return
+	}
+
+	delete(sc.selectorCache, key)
+	sc.deleteServiceLabelsCache(svc, selector)
 }
 
 // GetPodServiceMemberships returns a set of Service keys for Services that have
 // a selector matching the given pod.
-func (sc *ServiceSelectorCache) GetPodServiceMemberships(serviceLister v1listers.ServiceLister, pod *v1.Pod) (sets.String, error) {
+func (sc *ServiceSelectorCache) GetPodServiceMemberships(pod *v1.Pod) sets.String {
+	sc.serviceLabelsLock.RLock()
+	defer sc.serviceLabelsLock.RUnlock()
 	set := sets.String{}
-	services, err := serviceLister.Services(pod.Namespace).List(labels.Everything())
-	if err != nil {
-		return set, err
+	labelCacheCount := map[*ServiceSelector]int{}
+	nsLabelsCache, ok := sc.serviceLabelsCache[pod.Namespace]
+	if !ok {
+		return set
 	}
 
-	var selector labels.Selector
-	for _, service := range services {
-		if service.Spec.Selector == nil {
-			// if the service has a nil selector this means selectors match nothing, not everything.
+	// get service keys from label cache by pod labels.
+	for k, v := range pod.Labels {
+		labelKey := k + "=" + v
+		svcCache, ok := nsLabelsCache[labelKey]
+		if !ok {
 			continue
 		}
-		key, err := controller.KeyFunc(service)
-		if err != nil {
-			return nil, err
-		}
-		if v, ok := sc.Get(key); ok {
-			selector = v
-		} else {
-			selector = sc.Update(key, service.Spec.Selector)
-		}
-
-		if selector.Matches(labels.Set(pod.Labels)) {
-			set.Insert(key)
+		for _, svcSelector := range svcCache {
+			labelCacheCount[svcSelector] ++
 		}
 	}
-	return set, nil
+	for svcSelector, count := range labelCacheCount {
+		if count == len(svcSelector.selectorSet) {
+			set.Insert(svcSelector.serviceKey)
+		}
+	}
+	return set
 }
 
 // PortMapKey is used to uniquely identify groups of endpoint ports.
@@ -195,7 +272,7 @@ func podEndpointsChanged(oldPod, newPod *v1.Pod) (bool, bool) {
 
 // GetServicesToUpdateOnPodChange returns a set of Service keys for Services
 // that have potentially been affected by a change to this pod.
-func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selectorCache *ServiceSelectorCache, old, cur interface{}) sets.String {
+func (sc *ServiceSelectorCache) GetServicesToUpdateOnPodChange(old, cur interface{}) sets.String {
 	newPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
 	if newPod.ResourceVersion == oldPod.ResourceVersion {
@@ -211,17 +288,9 @@ func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selec
 		return sets.String{}
 	}
 
-	services, err := selectorCache.GetPodServiceMemberships(serviceLister, newPod)
-	if err != nil {
-		utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", newPod.Namespace, newPod.Name, err))
-		return sets.String{}
-	}
-
+	services := sc.GetPodServiceMemberships(newPod)
 	if labelsChanged {
-		oldServices, err := selectorCache.GetPodServiceMemberships(serviceLister, oldPod)
-		if err != nil {
-			utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", newPod.Namespace, newPod.Name, err))
-		}
+		oldServices := sc.GetPodServiceMemberships(oldPod)
 		services = determineNeededServiceUpdates(oldServices, services, podChanged)
 	}
 
@@ -291,4 +360,14 @@ func IsIPv6Service(svc *v1.Service) bool {
 		// assume it's IPv4.
 		return false
 	}
+}
+
+// convertSelectorToLabelsKVMap() convert map from map[key]value to map[key=value]bool
+func convertSelectorToLabelsKVMap(labelMap map[string]string) map[string]bool {
+	kvMap := map[string]bool{}
+	for k, v := range labelMap {
+		kv := k + "=" + v
+		kvMap[kv] = true
+	}
+	return kvMap
 }
